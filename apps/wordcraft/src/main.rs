@@ -320,6 +320,54 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether an input method daemon (IBus or Fcitx) is active on this system.
+fn has_active_ime() -> bool {
+    if std::env::var_os("IBUS_ADDRESS").is_some() {
+        return true;
+    }
+    for var in ["XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE"] {
+        if let Some(val) = std::env::var_os(var) {
+            let s = val.to_string_lossy();
+            if s.contains("ibus") || s.contains("fcitx") {
+                return true;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let bus_dir = home.join(".config/ibus/bus");
+        if let Ok(entries) = std::fs::read_dir(&bus_dir) {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    for line in content.lines() {
+                        if let Some(pid_str) = line.strip_prefix("IBUS_DAEMON_PID=") {
+                            let pid_path = format!("/proc/{}", pid_str.trim());
+                            if std::path::Path::new(&pid_path).exists() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+                let comm_path = entry.path().join("comm");
+                if let Ok(comm) = std::fs::read_to_string(comm_path) {
+                    let trimmed = comm.trim();
+                    if trimmed == "ibus-daemon" || trimmed == "fcitx5" || trimmed == "fcitx" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -404,8 +452,14 @@ fn main() -> eframe::Result {
     #[cfg(all(unix, not(target_os = "macos")))]
     // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
     // manager showed a "no" cursor. Run through XWayland when it's there; WORDCRAFT_WAYLAND=1
-    // keeps the native Wayland backend.
-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WORDCRAFT_WAYLAND").is_none() {
+    // keeps the native Wayland backend. But on Wayland desktops where an input method (IBus,
+    // Fcitx) is active, forcing XWayland disconnects the Wayland text-input protocol and leaves
+    // the app unable to connect to the IME, preventing non-Latin typing (Bangla, CJK...).
+    // In that case, keep the native Wayland backend unless WORDCRAFT_X11=1 explicitly forces X11.
+    if std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WORDCRAFT_WAYLAND").is_none()
+        && (std::env::var_os("WAYLAND_DISPLAY").is_none() || std::env::var_os("WORDCRAFT_X11").is_some() || !has_active_ime())
+    {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
             b.with_x11();
@@ -550,6 +604,13 @@ mod tests {
             assert!(app.session.doc.plain_text(wordcraft_doc::StoryRef::Body).contains("kept"), "{p:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn active_ime_detection_does_not_panic() {
+        // Must be safe and return a boolean without panicking under any environment.
+        let _ = super::has_active_ime();
     }
 }
 

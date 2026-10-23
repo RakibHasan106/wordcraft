@@ -226,6 +226,11 @@ fn is_modifier_key(key: Key) -> bool {
     )
 }
 
+/// Whether the Super / Windows / Command key is currently held.
+fn super_held(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(Key::SuperLeft) || i.key_down(Key::SuperRight) || i.modifiers.mac_cmd)
+}
+
 /// Whether releasing `key` with `modifiers` is Mod+Alt+V (Paste Special).
 fn is_paste_special_release(key: Key, modifiers: egui::Modifiers) -> bool {
     key == Key::V && modifiers.command && modifiers.alt && !modifiers.shift
@@ -344,7 +349,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
                 egui::Event::Text(t) => {
                     let m = ctx.input(|i| i.modifiers);
                     let is_cmd = if cfg!(target_os = "macos") { m.command } else { (m.command || m.ctrl) && !m.alt };
-                    if !is_cmd && !t.is_empty() && t.chars().all(|c| !c.is_control()) {
+                    if !is_cmd && !super_held(ctx) && !t.is_empty() && t.chars().all(|c| !c.is_control()) {
                         let _ = app.run("equation.type", json!({"text": t}));
                     }
                     continue;
@@ -369,7 +374,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
             egui::Event::Text(t) => {
                 let m = ctx.input(|i| i.modifiers);
                 let is_cmd = if cfg!(target_os = "macos") { m.command } else { (m.command || m.ctrl) && !m.alt };
-                if is_cmd {
+                if is_cmd || super_held(ctx) {
                     continue;
                 }
                 if t.chars().all(|c| !c.is_control()) && !t.is_empty() {
@@ -1265,5 +1270,35 @@ mod tests {
         a.run("edit.undo", json!({})).unwrap();
         let g = wordcraft_engine::cmd::smart_art::selected_smart_art(&a.session).expect("still there");
         assert_eq!(g.items[0].text, "Ada", "one undo step for the typing");
+    }
+
+    /// A system shortcut with the Super (Win / Logo) key held, such as Win+Space to switch
+    /// input methods, must not type a space or any other character into the document.
+    #[test]
+    fn super_space_does_not_type_space() {
+        let doc_text = |a: &WordApp| a.session.doc.plain_text(wordcraft_doc::StoryRef::Body);
+        let ctx = egui::Context::default();
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        let none = Modifiers::NONE;
+        let key = |key, pressed, modifiers| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers };
+        let frame = |a: &mut WordApp, events: Vec<egui::Event>| {
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                crate::keytips::logic(a, ui.ctx());
+                canvas_events(a, ui.ctx());
+            })
+            .drop_without_applying_deltas();
+        };
+
+        // Press Super (Win) key down.
+        frame(&mut a, vec![key(Key::SuperLeft, true, none)]);
+        // While Super is held, Space is pressed and emits Text(" ").
+        frame(&mut a, vec![key(Key::Space, true, none), egui::Event::Text(" ".into()), key(Key::Space, false, none)]);
+        // Release Super.
+        frame(&mut a, vec![key(Key::SuperLeft, false, none)]);
+        assert_eq!(doc_text(&a), "", "Win+Space must not type a space into the document");
+
+        // Normal typing after releasing Super still works.
+        frame(&mut a, vec![key(Key::A, true, none), egui::Event::Text("a".into()), key(Key::A, false, none)]);
+        assert_eq!(doc_text(&a).trim_end(), "a", "regular typing after Super release works");
     }
 }
