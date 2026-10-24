@@ -323,27 +323,31 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
 #[cfg(all(unix, not(target_os = "macos")))]
 /// Whether an input method daemon (IBus or Fcitx) is active on this system.
 fn has_active_ime() -> bool {
-    if std::env::var_os("IBUS_ADDRESS").is_some() {
-        return true;
-    }
-    for var in ["XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE"] {
-        if let Some(val) = std::env::var_os(var) {
-            let s = val.to_string_lossy();
-            if s.contains("ibus") || s.contains("fcitx") {
-                return true;
-            }
-        }
-    }
+    // Check ~/.config/ibus/bus for a live ibus-daemon PID file.
+    // Skip symlinks and special files (FIFOs, devices), and bound the read to avoid startup hangs.
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         let bus_dir = home.join(".config/ibus/bus");
         if let Ok(entries) = std::fs::read_dir(&bus_dir) {
             for entry in entries.flatten() {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    for line in content.lines() {
-                        if let Some(pid_str) = line.strip_prefix("IBUS_DAEMON_PID=") {
-                            let pid_path = format!("/proc/{}", pid_str.trim());
-                            if std::path::Path::new(&pid_path).exists() {
-                                return true;
+                if let Ok(ft) = entry.file_type()
+                    && ft.is_file()
+                    && !ft.is_symlink()
+                    && let Ok(meta) = entry.metadata()
+                    && meta.len() <= 4096
+                    && let Ok(f) = std::fs::File::open(entry.path())
+                {
+                    use std::io::Read;
+                    let mut content = String::new();
+                    if f.take(4096).read_to_string(&mut content).is_ok() {
+                        for line in content.lines() {
+                            if let Some(pid_str) = line.strip_prefix("IBUS_DAEMON_PID=") {
+                                let pid = pid_str.trim();
+                                if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
+                                    let pid_path = format!("/proc/{pid}");
+                                    if std::path::Path::new(&pid_path).exists() {
+                                        return true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -351,6 +355,8 @@ fn has_active_ime() -> bool {
             }
         }
     }
+
+    // Scan /proc for a running ibus-daemon or fcitx process.
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -366,6 +372,12 @@ fn has_active_ime() -> bool {
         }
     }
     false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether to force the X11 backend on Unix.
+fn should_use_x11(has_display: bool, has_wayland_display: bool, force_wayland: bool, force_x11: bool, has_ime: bool) -> bool {
+    has_display && !force_wayland && (!has_wayland_display || force_x11 || !has_ime)
 }
 
 fn main() -> eframe::Result {
@@ -456,10 +468,13 @@ fn main() -> eframe::Result {
     // Fcitx) is active, forcing XWayland disconnects the Wayland text-input protocol and leaves
     // the app unable to connect to the IME, preventing non-Latin typing (Bangla, CJK...).
     // In that case, keep the native Wayland backend unless WORDCRAFT_X11=1 explicitly forces X11.
-    if std::env::var_os("DISPLAY").is_some()
-        && std::env::var_os("WORDCRAFT_WAYLAND").is_none()
-        && (std::env::var_os("WAYLAND_DISPLAY").is_none() || std::env::var_os("WORDCRAFT_X11").is_some() || !has_active_ime())
-    {
+    if should_use_x11(
+        std::env::var_os("DISPLAY").is_some(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("WORDCRAFT_WAYLAND").is_some(),
+        std::env::var_os("WORDCRAFT_X11").is_some(),
+        has_active_ime(),
+    ) {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
             b.with_x11();
@@ -611,6 +626,29 @@ mod tests {
     fn active_ime_detection_does_not_panic() {
         // Must be safe and return a boolean without panicking under any environment.
         let _ = super::has_active_ime();
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn x11_backend_routing_logic() {
+        use super::should_use_x11;
+        // No DISPLAY -> never force X11
+        assert!(!should_use_x11(false, false, false, false, false));
+        assert!(!should_use_x11(false, true, false, false, false));
+
+        // Pure X11 desktop (DISPLAY set, no WAYLAND_DISPLAY) -> force X11
+        assert!(should_use_x11(true, false, false, false, false));
+        assert!(should_use_x11(true, false, false, false, true));
+
+        // Wayland session without an active IME -> force X11 for file drag-and-drop (#220)
+        assert!(should_use_x11(true, true, false, false, false));
+
+        // Wayland session with an active IME -> keep native Wayland (do not force X11)
+        assert!(!should_use_x11(true, true, false, false, true));
+
+        // Explicit overrides take precedence
+        assert!(should_use_x11(true, true, false, true, true), "WORDCRAFT_X11 forces X11 even with IME");
+        assert!(!should_use_x11(true, false, true, false, false), "WORDCRAFT_WAYLAND skips X11");
     }
 }
 
