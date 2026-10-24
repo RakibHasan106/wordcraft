@@ -321,15 +321,74 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+/// Whether the dconf preload-engines list contains a non-Latin input engine.
+fn has_non_latin_in_dconf(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        for item in inner.split(',') {
+            let engine = item.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+            if !engine.is_empty() && !engine.starts_with("xkb:") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether the GNOME desktop input-sources list contains an IBus engine.
+fn has_non_latin_in_gsettings(output: &str) -> bool {
+    output.contains("'ibus'") || output.contains("\"ibus\"")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Checks whether a non-Latin IBus input engine (e.g. OpenBangla, Mozc, Libpinyin) is configured.
+/// GNOME Wayland sessions run ibus-daemon by default even for Latin-only users, so running ibus-daemon
+/// alone does not imply non-Latin IME usage.
+fn has_non_latin_ibus_engine() -> bool {
+    if let Ok(output) = std::process::Command::new("dconf").args(["read", "/desktop/ibus/general/preload-engines"]).output()
+        && output.status.success()
+        && has_non_latin_in_dconf(&String::from_utf8_lossy(&output.stdout))
+    {
+        return true;
+    }
+
+    if let Ok(output) = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.input-sources", "sources"]).output()
+        && output.status.success()
+        && has_non_latin_in_gsettings(&String::from_utf8_lossy(&output.stdout))
+    {
+        return true;
+    }
+
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Whether an input method daemon (IBus or Fcitx) is active for the current user's session.
 fn has_active_ime() -> bool {
     use std::os::unix::fs::MetadataExt;
 
+    // Explicit IME environment variables always indicate an active input method.
+    let has_ime_env = ["GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"].iter().any(|var| {
+        std::env::var_os(var).is_some_and(|v| {
+            let s = v.to_string_lossy().to_ascii_lowercase();
+            s.contains("ibus") || s.contains("fcitx")
+        })
+    });
+    if has_ime_env {
+        return true;
+    }
+
     // Check process ownership so processes from other users or sessions on multi-user systems are ignored.
     let current_uid = std::fs::metadata(format!("/proc/{}", std::process::id())).map(|m| m.uid()).ok();
 
+    let mut non_latin_ibus: Option<bool> = None;
+    let mut is_non_latin_ibus = || *non_latin_ibus.get_or_insert_with(has_non_latin_ibus_engine);
+
     // 1. Check ~/.config/ibus/bus for an active ibus-daemon PID file for this user's session.
-    // Skip symlinks and special files (FIFOs, devices), and bound the read to avoid startup hangs.
+    // Verify that /proc/<pid>/comm equals "ibus-daemon" (to guard against stale PID files with reused PIDs)
+    // and verify that a non-Latin input engine is configured before treating IBus as active.
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         let bus_dir = home.join(".config/ibus/bus");
         if let Ok(entries) = std::fs::read_dir(&bus_dir) {
@@ -351,6 +410,9 @@ fn has_active_ime() -> bool {
                                     let pid_path = format!("/proc/{pid}");
                                     if let Ok(p_meta) = std::fs::metadata(&pid_path)
                                         && (current_uid.is_none() || current_uid == Some(p_meta.uid()))
+                                        && let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                                        && comm.trim() == "ibus-daemon"
+                                        && is_non_latin_ibus()
                                     {
                                         return true;
                                     }
@@ -363,9 +425,9 @@ fn has_active_ime() -> bool {
         }
     }
 
-    // 2. Scan /proc for an active IME daemon (ibus-daemon, fcitx5, or fcitx) owned by the current user.
-    // This detects running daemons on pure Wayland sessions where legacy X11 environment variables
-    // (such as XMODIFIERS) are unset.
+    // 2. Scan /proc for an active IME daemon owned by the current user.
+    // Fcitx (fcitx5/fcitx) is explicitly installed and run for IME composition.
+    // ibus-daemon runs by default on GNOME, so we only treat it as active if a non-Latin engine is configured.
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -376,7 +438,10 @@ fn has_active_ime() -> bool {
                 let comm_path = entry.path().join("comm");
                 if let Ok(comm) = std::fs::read_to_string(comm_path) {
                     let trimmed = comm.trim();
-                    if trimmed == "ibus-daemon" || trimmed == "fcitx5" || trimmed == "fcitx" {
+                    if trimmed == "fcitx5" || trimmed == "fcitx" {
+                        return true;
+                    }
+                    if trimmed == "ibus-daemon" && is_non_latin_ibus() {
                         return true;
                     }
                 }
@@ -631,6 +696,26 @@ mod tests {
             assert!(app.session.doc.plain_text(wordcraft_doc::StoryRef::Body).contains("kept"), "{p:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn ibus_engine_parsing_logic() {
+        use super::{has_non_latin_in_dconf, has_non_latin_in_gsettings};
+        // Latin-only IBus configurations
+        assert!(!has_non_latin_in_dconf("['xkb:us::eng']"));
+        assert!(!has_non_latin_in_dconf("['xkb:gb::eng', 'xkb:fr::fra']"));
+        assert!(!has_non_latin_in_dconf("[]"));
+        assert!(!has_non_latin_in_dconf(""));
+        assert!(!has_non_latin_in_gsettings("@a(ss) []"));
+        assert!(!has_non_latin_in_gsettings("[('xkb', 'us')]"));
+
+        // Non-Latin IBus configurations
+        assert!(has_non_latin_in_dconf("['xkb:us::eng', 'OpenBangla']"));
+        assert!(has_non_latin_in_dconf("['libpinyin']"));
+        assert!(has_non_latin_in_dconf("['xkb:us::eng', 'mozc-jp']"));
+        assert!(has_non_latin_in_gsettings("[('xkb', 'us'), ('ibus', 'openbangla-keyboard')]"));
+        assert!(has_non_latin_in_gsettings("[('ibus', 'libpinyin')]"));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

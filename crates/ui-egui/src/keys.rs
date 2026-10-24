@@ -276,9 +276,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
         app.canvas.paste_mods = Some(held);
     }
     // Super (Win / Logo / Cmd) held since an earlier frame, updated in event order below.
-    // egui's `key_down` is false if the key is released at any point in the current frame,
-    // so we preserve `app.canvas.super_held` across frames until an explicit release is reached.
-    let mut super_key_held = app.canvas.super_held || ctx.input(|i| i.key_down(Key::SuperLeft) || i.key_down(Key::SuperRight));
+    let mut super_key_held = app.canvas.super_held;
     let mut mac_cmd_held = ctx.input(|i| i.modifiers.mac_cmd);
     for e in events {
         // Track Super and Command state in event order so same-frame shortcuts are detected.
@@ -289,6 +287,9 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
             }
             egui::Event::ModifiersChanged(m) => {
                 mac_cmd_held = m.mac_cmd;
+                if m.is_none() {
+                    super_key_held = false;
+                }
             }
             egui::Event::WindowFocused(false) => {
                 super_key_held = false;
@@ -1339,5 +1340,12 @@ mod tests {
         // Normal typing after releasing Super still works.
         frame(&mut a, vec![key(Key::A, true, none), egui::Event::Text("a".into()), key(Key::A, false, none)]);
         assert_eq!(doc_text(&a).trim_end(), "a", "regular typing after Super release works");
+
+        // Compositor swallows Super-up: ModifiersChanged(none) clears super_held.
+        frame(&mut a, vec![key(Key::SuperLeft, true, none)]);
+        // Compositor consumes Super release, sends ModifiersChanged with no modifiers.
+        frame(&mut a, vec![egui::Event::ModifiersChanged(none)]);
+        frame(&mut a, vec![key(Key::B, true, none), egui::Event::Text("b".into()), key(Key::B, false, none)]);
+        assert_eq!(doc_text(&a).trim_end(), "ab", "typing works after swallowed Super release cleared by ModifiersChanged");
     }
 }
