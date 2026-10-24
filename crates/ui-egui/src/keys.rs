@@ -276,7 +276,9 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
         app.canvas.paste_mods = Some(held);
     }
     // Super (Win / Logo / Cmd) held since an earlier frame, updated in event order below.
-    let mut super_key_held = ctx.input(|i| i.key_down(Key::SuperLeft) || i.key_down(Key::SuperRight));
+    // egui's `key_down` is false if the key is released at any point in the current frame,
+    // so we preserve `app.canvas.super_held` across frames until an explicit release is reached.
+    let mut super_key_held = app.canvas.super_held || ctx.input(|i| i.key_down(Key::SuperLeft) || i.key_down(Key::SuperRight));
     let mut mac_cmd_held = ctx.input(|i| i.modifiers.mac_cmd);
     for e in events {
         // Track Super and Command state in event order so same-frame shortcuts are detected.
@@ -493,6 +495,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
             _ => {}
         }
     }
+    app.canvas.super_held = super_key_held;
 }
 
 /// Escape leaves Focus or Full Screen View (#1678), then Full Screen (#980), once nothing nearer
@@ -1316,6 +1319,16 @@ mod tests {
             ],
         );
         assert_eq!(doc_text(&a), "", "Win+Space within a single frame must not type a space into the document");
+
+        // Cross-frame release: Super down in frame 1; Space-down, Text(" "), Space-up, and Super-up in frame 2.
+        // In egui, `ctx.input(|i| i.key_down(Key::SuperLeft))` is false in frame 2 because it is released
+        // within frame 2; the prior-frame state in app.canvas.super_held must preserve it until the release event.
+        frame(&mut a, vec![key(Key::SuperLeft, true, none)]);
+        frame(
+            &mut a,
+            vec![key(Key::Space, true, none), egui::Event::Text(" ".into()), key(Key::Space, false, none), key(Key::SuperLeft, false, none)],
+        );
+        assert_eq!(doc_text(&a), "", "Space before Super-up in the next frame must not type a space into the document");
 
         // Across multiple frames: Super down in frame 1, Space+Text in frame 2, Super up in frame 3.
         frame(&mut a, vec![key(Key::SuperLeft, true, none)]);

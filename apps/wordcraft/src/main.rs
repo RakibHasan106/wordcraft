@@ -321,9 +321,14 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-/// Whether an input method daemon (IBus or Fcitx) is active on this system.
+/// Whether an input method daemon (IBus or Fcitx) is active for the current user's session.
 fn has_active_ime() -> bool {
-    // Check ~/.config/ibus/bus for a live ibus-daemon PID file.
+    use std::os::unix::fs::MetadataExt;
+
+    // Check process ownership so processes from other users or sessions on multi-user systems are ignored.
+    let current_uid = std::fs::metadata(format!("/proc/{}", std::process::id())).map(|m| m.uid()).ok();
+
+    // 1. Check ~/.config/ibus/bus for an active ibus-daemon PID file for this user's session.
     // Skip symlinks and special files (FIFOs, devices), and bound the read to avoid startup hangs.
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         let bus_dir = home.join(".config/ibus/bus");
@@ -344,7 +349,9 @@ fn has_active_ime() -> bool {
                                 let pid = pid_str.trim();
                                 if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
                                     let pid_path = format!("/proc/{pid}");
-                                    if std::path::Path::new(&pid_path).exists() {
+                                    if let Ok(p_meta) = std::fs::metadata(&pid_path)
+                                        && (current_uid.is_none() || current_uid == Some(p_meta.uid()))
+                                    {
                                         return true;
                                     }
                                 }
@@ -356,11 +363,35 @@ fn has_active_ime() -> bool {
         }
     }
 
-    // Scan /proc for a running ibus-daemon or fcitx process.
-    if let Ok(entries) = std::fs::read_dir("/proc") {
+    // 2. Check if the current session environment hints at an IME (IBUS_ADDRESS, XMODIFIERS, GTK_IM_MODULE, QT_IM_MODULE)
+    // or if the session's runtime dir contains an active fcitx socket.
+    let mut session_ime_hint = std::env::var_os("IBUS_ADDRESS").is_some();
+    if !session_ime_hint {
+        for var in ["XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE"] {
+            if let Some(val) = std::env::var_os(var) {
+                let s = val.to_string_lossy();
+                if s.contains("ibus") || s.contains("fcitx") {
+                    session_ime_hint = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !session_ime_hint
+        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
+        && runtime_dir.join("fcitx5").exists()
+    {
+        session_ime_hint = true;
+    }
+
+    // When the session has an IME configured, scan /proc for an active daemon owned by the current user.
+    if session_ime_hint && let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+            if name.to_string_lossy().chars().all(|c| c.is_ascii_digit())
+                && let Ok(meta) = entry.metadata()
+                && (current_uid.is_none() || current_uid == Some(meta.uid()))
+            {
                 let comm_path = entry.path().join("comm");
                 if let Ok(comm) = std::fs::read_to_string(comm_path) {
                     let trimmed = comm.trim();
