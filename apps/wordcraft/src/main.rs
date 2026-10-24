@@ -363,29 +363,10 @@ fn has_active_ime() -> bool {
         }
     }
 
-    // 2. Check if the current session environment hints at an IME (IBUS_ADDRESS, XMODIFIERS, GTK_IM_MODULE, QT_IM_MODULE)
-    // or if the session's runtime dir contains an active fcitx socket.
-    let mut session_ime_hint = std::env::var_os("IBUS_ADDRESS").is_some();
-    if !session_ime_hint {
-        for var in ["XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE"] {
-            if let Some(val) = std::env::var_os(var) {
-                let s = val.to_string_lossy();
-                if s.contains("ibus") || s.contains("fcitx") {
-                    session_ime_hint = true;
-                    break;
-                }
-            }
-        }
-    }
-    if !session_ime_hint
-        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)
-        && runtime_dir.join("fcitx5").exists()
-    {
-        session_ime_hint = true;
-    }
-
-    // When the session has an IME configured, scan /proc for an active daemon owned by the current user.
-    if session_ime_hint && let Ok(entries) = std::fs::read_dir("/proc") {
+    // 2. Scan /proc for an active IME daemon (ibus-daemon, fcitx5, or fcitx) owned by the current user.
+    // This detects running daemons on pure Wayland sessions where legacy X11 environment variables
+    // (such as XMODIFIERS) are unset.
+    if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().chars().all(|c| c.is_ascii_digit())
