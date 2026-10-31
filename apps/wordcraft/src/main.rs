@@ -321,14 +321,20 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-/// Whether the dconf preload-engines list contains a non-Latin input engine.
+/// Whether an engine identifier represents a non-Latin IBus input engine.
+fn is_non_latin_engine_name(engine: &str) -> bool {
+    let trimmed = engine.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    !trimmed.is_empty() && !trimmed.starts_with("xkb:") && !trimmed.contains(' ')
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether the dconf preload-engines or engines-order list contains a non-Latin input engine.
 fn has_non_latin_in_dconf(output: &str) -> bool {
     let trimmed = output.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];
         for item in inner.split(',') {
-            let engine = item.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-            if !engine.is_empty() && !engine.starts_with("xkb:") {
+            if is_non_latin_engine_name(item) {
                 return true;
             }
         }
@@ -343,17 +349,29 @@ fn has_non_latin_in_gsettings(output: &str) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-/// Checks whether a non-Latin IBus input engine (e.g. OpenBangla, Mozc, Libpinyin) is configured.
+/// Checks whether a non-Latin IBus input engine (e.g. OpenBangla, Mozc, Libpinyin) is active or configured.
 /// GNOME Wayland sessions run ibus-daemon by default even for Latin-only users, so running ibus-daemon
 /// alone does not imply non-Latin IME usage.
 fn has_non_latin_ibus_engine() -> bool {
-    if let Ok(output) = std::process::Command::new("dconf").args(["read", "/desktop/ibus/general/preload-engines"]).output()
+    // 1. Check IBus's live GlobalEngine directly via `ibus engine`.
+    if let Ok(output) = std::process::Command::new("ibus").arg("engine").output()
         && output.status.success()
-        && has_non_latin_in_dconf(&String::from_utf8_lossy(&output.stdout))
+        && is_non_latin_engine_name(&String::from_utf8_lossy(&output.stdout))
     {
         return true;
     }
 
+    // 2. Check dconf preload-engines and engines-order lists.
+    for key in ["/desktop/ibus/general/preload-engines", "/desktop/ibus/general/engines-order"] {
+        if let Ok(output) = std::process::Command::new("dconf").args(["read", key]).output()
+            && output.status.success()
+            && has_non_latin_in_dconf(&String::from_utf8_lossy(&output.stdout))
+        {
+            return true;
+        }
+    }
+
+    // 3. Check GNOME desktop input-sources.
     if let Ok(output) = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.input-sources", "sources"]).output()
         && output.status.success()
         && has_non_latin_in_gsettings(&String::from_utf8_lossy(&output.stdout))
@@ -705,7 +723,18 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn ibus_engine_parsing_logic() {
-        use super::{has_non_latin_in_dconf, has_non_latin_in_gsettings};
+        use super::{has_non_latin_in_dconf, has_non_latin_in_gsettings, is_non_latin_engine_name};
+        // Engine name checks
+        assert!(!is_non_latin_engine_name("xkb:us::eng"));
+        assert!(!is_non_latin_engine_name("xkb:gb::eng"));
+        assert!(!is_non_latin_engine_name(""));
+        assert!(!is_non_latin_engine_name("No engine is set."));
+        assert!(is_non_latin_engine_name("OpenBangla"));
+        assert!(is_non_latin_engine_name("libpinyin"));
+        assert!(is_non_latin_engine_name("mozc-jp"));
+        assert!(is_non_latin_engine_name("'OpenBangla'"));
+        assert!(is_non_latin_engine_name("\"libpinyin\""));
+
         // Latin-only IBus configurations
         assert!(!has_non_latin_in_dconf("['xkb:us::eng']"));
         assert!(!has_non_latin_in_dconf("['xkb:gb::eng', 'xkb:fr::fra']"));
