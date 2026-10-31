@@ -328,18 +328,29 @@ fn is_non_latin_engine_name(engine: &str) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-/// Whether the dconf preload-engines or engines-order list contains a non-Latin input engine.
-fn has_non_latin_in_dconf(output: &str) -> bool {
+/// Parses a dconf string array like "['engine1', 'engine2']" into individual engine names.
+fn parse_dconf_engines(output: &str) -> Vec<String> {
     let trimmed = output.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        for item in inner.split(',') {
-            if is_non_latin_engine_name(item) {
-                return true;
-            }
-        }
+        inner.split(',').map(|item| item.trim().trim_matches(|c| c == '\'' || c == '"').trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else {
+        Vec::new()
     }
-    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether the dconf preload-engines list contains a non-Latin input engine.
+fn has_non_latin_in_dconf(output: &str) -> bool {
+    parse_dconf_engines(output).iter().any(|item| is_non_latin_engine_name(item))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Whether the engines-order list contains a non-Latin engine that is also present in preload-engines.
+/// IBus filters saved orderings against preload-engines, retaining engines removed from active configuration.
+fn has_non_latin_in_engines_order(order_output: &str, preload_output: &str) -> bool {
+    let preload = parse_dconf_engines(preload_output);
+    parse_dconf_engines(order_output).iter().any(|engine| preload.contains(engine) && is_non_latin_engine_name(engine))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -349,32 +360,85 @@ fn has_non_latin_in_gsettings(output: &str) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+/// Runs a probe command with a timeout deadline. If the child process exceeds the timeout,
+/// it is terminated and reaped to avoid hanging startup or leaving zombie processes.
+fn run_probe_with_timeout(program: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new(program).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    if let Some(status) = status
+        && status.success()
+        && let Some(mut stream) = child.stdout.take()
+    {
+        let mut stdout = Vec::new();
+        if stream.read_to_end(&mut stdout).is_ok() {
+            return Some(String::from_utf8_lossy(&stdout).into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+/// Runs a probe command with the default startup timeout (200ms).
+fn run_bounded_probe(program: &str, args: &[&str]) -> Option<String> {
+    run_probe_with_timeout(program, args, std::time::Duration::from_millis(200))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Checks whether a non-Latin IBus input engine (e.g. OpenBangla, Mozc, Libpinyin) is active or configured.
 /// GNOME Wayland sessions run ibus-daemon by default even for Latin-only users, so running ibus-daemon
 /// alone does not imply non-Latin IME usage.
 fn has_non_latin_ibus_engine() -> bool {
     // 1. Check IBus's live GlobalEngine directly via `ibus engine`.
-    if let Ok(output) = std::process::Command::new("ibus").arg("engine").output()
-        && output.status.success()
-        && is_non_latin_engine_name(&String::from_utf8_lossy(&output.stdout))
+    if let Some(output) = run_bounded_probe("ibus", &["engine"])
+        && is_non_latin_engine_name(&output)
     {
         return true;
     }
 
     // 2. Check dconf preload-engines and engines-order lists.
-    for key in ["/desktop/ibus/general/preload-engines", "/desktop/ibus/general/engines-order"] {
-        if let Ok(output) = std::process::Command::new("dconf").args(["read", key]).output()
-            && output.status.success()
-            && has_non_latin_in_dconf(&String::from_utf8_lossy(&output.stdout))
-        {
-            return true;
-        }
+    // Entries in engines-order count as active only when they also appear in the configured
+    // preload-engines list; engines-order can retain engines that were removed from configuration.
+    let preload_output = run_bounded_probe("dconf", &["read", "/desktop/ibus/general/preload-engines"]);
+    if let Some(ref preload) = preload_output
+        && has_non_latin_in_dconf(preload)
+    {
+        return true;
+    }
+
+    if let Some(ref preload) = preload_output
+        && let Some(order_output) = run_bounded_probe("dconf", &["read", "/desktop/ibus/general/engines-order"])
+        && has_non_latin_in_engines_order(&order_output, preload)
+    {
+        return true;
     }
 
     // 3. Check GNOME desktop input-sources.
-    if let Ok(output) = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.input-sources", "sources"]).output()
-        && output.status.success()
-        && has_non_latin_in_gsettings(&String::from_utf8_lossy(&output.stdout))
+    if let Some(output) = run_bounded_probe("gsettings", &["get", "org.gnome.desktop.input-sources", "sources"])
+        && has_non_latin_in_gsettings(&output)
     {
         return true;
     }
@@ -723,7 +787,9 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn ibus_engine_parsing_logic() {
-        use super::{has_non_latin_in_dconf, has_non_latin_in_gsettings, is_non_latin_engine_name};
+        use super::{
+            has_non_latin_in_dconf, has_non_latin_in_engines_order, has_non_latin_in_gsettings, is_non_latin_engine_name, parse_dconf_engines,
+        };
         // Engine name checks
         assert!(!is_non_latin_engine_name("xkb:us::eng"));
         assert!(!is_non_latin_engine_name("xkb:gb::eng"));
@@ -734,6 +800,11 @@ mod tests {
         assert!(is_non_latin_engine_name("mozc-jp"));
         assert!(is_non_latin_engine_name("'OpenBangla'"));
         assert!(is_non_latin_engine_name("\"libpinyin\""));
+
+        // Dconf engine array parsing
+        assert_eq!(parse_dconf_engines("['xkb:us::eng', 'OpenBangla']"), vec!["xkb:us::eng", "OpenBangla"]);
+        assert_eq!(parse_dconf_engines("[]"), Vec::<String>::new());
+        assert_eq!(parse_dconf_engines(""), Vec::<String>::new());
 
         // Latin-only IBus configurations
         assert!(!has_non_latin_in_dconf("['xkb:us::eng']"));
@@ -749,6 +820,41 @@ mod tests {
         assert!(has_non_latin_in_dconf("['xkb:us::eng', 'mozc-jp']"));
         assert!(has_non_latin_in_gsettings("[('xkb', 'us'), ('ibus', 'openbangla-keyboard')]"));
         assert!(has_non_latin_in_gsettings("[('ibus', 'libpinyin')]"));
+
+        // engines-order filtering against active preload-engines
+        // Active non-Latin engine present in both lists
+        assert!(has_non_latin_in_engines_order("['hangul', 'xkb:us::eng']", "['xkb:us::eng', 'hangul']"));
+        // Stale non-Latin engine retained in engines-order but removed from preload-engines must not count
+        assert!(!has_non_latin_in_engines_order("['hangul', 'xkb:us::eng']", "['xkb:us::eng']"));
+        // Latin-only in both
+        assert!(!has_non_latin_in_engines_order("['xkb:us::eng']", "['xkb:us::eng']"));
+        // Empty lists
+        assert!(!has_non_latin_in_engines_order("[]", "[]"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn probe_timeout_handling() {
+        use super::run_probe_with_timeout;
+        use std::time::Duration;
+
+        // Successful command executes and returns output
+        let out = run_probe_with_timeout("echo", &["test_probe"], Duration::from_millis(500));
+        assert_eq!(out.as_deref().map(str::trim), Some("test_probe"));
+
+        // Non-zero exit code returns None
+        let out = run_probe_with_timeout("false", &[], Duration::from_millis(500));
+        assert_eq!(out, None);
+
+        // Missing command returns None
+        let out = run_probe_with_timeout("non_existent_command_xyz_404", &[], Duration::from_millis(500));
+        assert_eq!(out, None);
+
+        // Hanging command is killed and reaped within timeout
+        let start = std::time::Instant::now();
+        let out = run_probe_with_timeout("sleep", &["10"], Duration::from_millis(50));
+        assert_eq!(out, None);
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
