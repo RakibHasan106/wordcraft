@@ -369,14 +369,13 @@ fn has_non_latin_ibus_engine() -> bool {
 fn has_active_ime() -> bool {
     use std::os::unix::fs::MetadataExt;
 
-    // Explicit IME environment variables always indicate an active input method.
-    let has_ime_env = ["GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"].iter().any(|var| {
-        std::env::var_os(var).is_some_and(|v| {
-            let s = v.to_string_lossy().to_ascii_lowercase();
-            s.contains("ibus") || s.contains("fcitx")
-        })
-    });
-    if has_ime_env {
+    let env_mentions = |needle: &str| {
+        ["GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"]
+            .iter()
+            .any(|var| std::env::var_os(var).is_some_and(|v| v.to_string_lossy().to_ascii_lowercase().contains(needle)))
+    };
+    // Fcitx is installed on purpose, so its variables are a reliable signal.
+    if env_mentions("fcitx") {
         return true;
     }
 
@@ -385,6 +384,11 @@ fn has_active_ime() -> bool {
 
     let mut non_latin_ibus: Option<bool> = None;
     let mut is_non_latin_ibus = || *non_latin_ibus.get_or_insert_with(has_non_latin_ibus_engine);
+
+    // GNOME sets the IBus variables for Latin-only users too, so they only count with a non-Latin engine.
+    if env_mentions("ibus") && is_non_latin_ibus() {
+        return true;
+    }
 
     // 1. Check ~/.config/ibus/bus for an active ibus-daemon PID file for this user's session.
     // Verify that /proc/<pid>/comm equals "ibus-daemon" (to guard against stale PID files with reused PIDs)
@@ -453,8 +457,8 @@ fn has_active_ime() -> bool {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 /// Whether to force the X11 backend on Unix.
-fn should_use_x11(has_display: bool, has_wayland_display: bool, force_wayland: bool, force_x11: bool, has_ime: bool) -> bool {
-    has_display && !force_wayland && (!has_wayland_display || force_x11 || !has_ime)
+fn should_use_x11(has_display: bool, has_wayland_display: bool, force_wayland: bool, force_x11: bool, has_ime: impl FnOnce() -> bool) -> bool {
+    has_display && !force_wayland && (!has_wayland_display || force_x11 || !has_ime())
 }
 
 fn main() -> eframe::Result {
@@ -550,7 +554,7 @@ fn main() -> eframe::Result {
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
         std::env::var_os("WORDCRAFT_WAYLAND").is_some(),
         std::env::var_os("WORDCRAFT_X11").is_some(),
-        has_active_ime(),
+        has_active_ime,
     ) {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
@@ -730,22 +734,51 @@ mod tests {
     fn x11_backend_routing_logic() {
         use super::should_use_x11;
         // No DISPLAY -> never force X11
-        assert!(!should_use_x11(false, false, false, false, false));
-        assert!(!should_use_x11(false, true, false, false, false));
+        assert!(!should_use_x11(false, false, false, false, || false));
+        assert!(!should_use_x11(false, true, false, false, || false));
 
         // Pure X11 desktop (DISPLAY set, no WAYLAND_DISPLAY) -> force X11
-        assert!(should_use_x11(true, false, false, false, false));
-        assert!(should_use_x11(true, false, false, false, true));
+        assert!(should_use_x11(true, false, false, false, || false));
+        assert!(should_use_x11(true, false, false, false, || true));
 
         // Wayland session without an active IME -> force X11 for file drag-and-drop (#220)
-        assert!(should_use_x11(true, true, false, false, false));
+        assert!(should_use_x11(true, true, false, false, || false));
 
         // Wayland session with an active IME -> keep native Wayland (do not force X11)
-        assert!(!should_use_x11(true, true, false, false, true));
+        assert!(!should_use_x11(true, true, false, false, || true));
 
         // Explicit overrides take precedence
-        assert!(should_use_x11(true, true, false, true, true), "WORDCRAFT_X11 forces X11 even with IME");
-        assert!(!should_use_x11(true, false, true, false, false), "WORDCRAFT_WAYLAND skips X11");
+        assert!(should_use_x11(true, true, false, true, || true), "WORDCRAFT_X11 forces X11 even with IME");
+        assert!(!should_use_x11(true, false, true, false, || false), "WORDCRAFT_WAYLAND skips X11");
+
+        // IME detection is evaluated lazily only when backend selection depends on it
+        let mut called = false;
+        assert!(!should_use_x11(false, true, false, false, || {
+            called = true;
+            true
+        }));
+        assert!(!called, "has_ime callback must not be invoked when DISPLAY is absent");
+
+        called = false;
+        assert!(should_use_x11(true, false, false, false, || {
+            called = true;
+            false
+        }));
+        assert!(!called, "has_ime callback must not be invoked when WAYLAND_DISPLAY is absent");
+
+        called = false;
+        assert!(!should_use_x11(true, true, true, false, || {
+            called = true;
+            false
+        }));
+        assert!(!called, "has_ime callback must not be invoked when WORDCRAFT_WAYLAND is set");
+
+        called = false;
+        assert!(should_use_x11(true, true, false, true, || {
+            called = true;
+            true
+        }));
+        assert!(!called, "has_ime callback must not be invoked when WORDCRAFT_X11 is set");
     }
 }
 

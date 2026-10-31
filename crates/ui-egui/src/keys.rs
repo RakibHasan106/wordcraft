@@ -271,29 +271,38 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
     // `DeleteSurrounding` and the text replacing what it erased arrive in the same frame.
     app.canvas.ime_join_text = None;
     // Mod held since an earlier frame (its ModifiersChanged went by then).
-    let held = ctx.input(|i| i.modifiers);
+    let input_mods = ctx.input(|i| i.modifiers);
+    let held = if input_mods.is_none() { app.canvas.modifiers } else { input_mods };
     if held.command {
         app.canvas.paste_mods = Some(held);
     }
     // Super (Win / Logo / Cmd) held since an earlier frame, updated in event order below.
     let mut super_key_held = app.canvas.super_held;
     let mut mac_cmd_held = ctx.input(|i| i.modifiers.mac_cmd);
+    let mut current_mods = held;
     for e in events {
         // Track Super and Command state in event order so same-frame shortcuts are detected.
         match &e {
             egui::Event::Key { key: Key::SuperLeft | Key::SuperRight, pressed, modifiers, .. } => {
                 super_key_held = *pressed;
                 mac_cmd_held = modifiers.mac_cmd;
+                current_mods = *modifiers;
+            }
+            egui::Event::Key { modifiers, .. } => {
+                current_mods = *modifiers;
             }
             egui::Event::ModifiersChanged(m) => {
                 mac_cmd_held = m.mac_cmd;
-                if m.is_none() {
+                let had_other_mods = current_mods.shift || current_mods.ctrl || current_mods.alt;
+                current_mods = *m;
+                if m.is_none() && !had_other_mods {
                     super_key_held = false;
                 }
             }
             egui::Event::WindowFocused(false) => {
                 super_key_held = false;
                 mac_cmd_held = false;
+                current_mods = egui::Modifiers::default();
             }
             _ => {}
         }
@@ -497,6 +506,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
         }
     }
     app.canvas.super_held = super_key_held;
+    app.canvas.modifiers = current_mods;
 }
 
 /// Escape leaves Focus or Full Screen View (#1678), then Full Screen (#980), once nothing nearer
@@ -1347,5 +1357,30 @@ mod tests {
         frame(&mut a, vec![egui::Event::ModifiersChanged(none)]);
         frame(&mut a, vec![key(Key::B, true, none), egui::Event::Text("b".into()), key(Key::B, false, none)]);
         assert_eq!(doc_text(&a).trim_end(), "ab", "typing works after swallowed Super release cleared by ModifiersChanged");
+
+        // Super held while Shift is pressed and released: ModifiersChanged(none) from Shift release
+        // must not clear super_key_held; subsequent Super+Space must not type a space.
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        frame(&mut a, vec![key(Key::SuperLeft, true, none)]);
+        frame(&mut a, vec![egui::Event::ModifiersChanged(shift)]);
+        frame(&mut a, vec![egui::Event::ModifiersChanged(none)]);
+        frame(&mut a, vec![key(Key::Space, true, none), egui::Event::Text(" ".into()), key(Key::Space, false, none)]);
+        assert_eq!(doc_text(&a).trim_end(), "ab", "releasing Shift while Super is held must not allow Super+Space to type space");
+        // Same-frame Shift press and release while Super is held.
+        frame(
+            &mut a,
+            vec![
+                egui::Event::ModifiersChanged(shift),
+                egui::Event::ModifiersChanged(none),
+                key(Key::Space, true, none),
+                egui::Event::Text(" ".into()),
+                key(Key::Space, false, none),
+            ],
+        );
+        assert_eq!(doc_text(&a).trim_end(), "ab", "same-frame Shift release while Super is held must not type space");
+        // Releasing Super allows typing again.
+        frame(&mut a, vec![key(Key::SuperLeft, false, none)]);
+        frame(&mut a, vec![key(Key::C, true, none), egui::Event::Text("c".into()), key(Key::C, false, none)]);
+        assert_eq!(doc_text(&a).trim_end(), "abc", "typing resumes after Super is released");
     }
 }
