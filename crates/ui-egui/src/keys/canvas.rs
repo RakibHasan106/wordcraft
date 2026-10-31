@@ -57,6 +57,7 @@ pub fn canvas_events(app: &mut WordApp, ctx: &egui::Context) {
         interrupted_preedit: std::mem::take(&mut app.canvas.ime_interrupted_preedit),
         interrupted_replacement: EquationReplacementDrop::None,
         super_key_held,
+        super_pressed_in_batch: false,
         mac_cmd_held,
         current_mods: held,
     };
@@ -89,6 +90,7 @@ struct Batch {
     interrupted_preedit: bool,
     interrupted_replacement: EquationReplacementDrop,
     super_key_held: bool,
+    super_pressed_in_batch: bool,
     mac_cmd_held: bool,
     current_mods: Modifiers,
 }
@@ -181,6 +183,7 @@ fn note_key_state(app: &mut WordApp, e: &egui::Event, b: &mut Batch) {
     match e {
         egui::Event::Key { key: Key::SuperLeft | Key::SuperRight, pressed, modifiers, .. } => {
             b.super_key_held = *pressed;
+            b.super_pressed_in_batch = *pressed;
             b.mac_cmd_held = modifiers.mac_cmd;
             b.current_mods = *modifiers;
         }
@@ -191,12 +194,13 @@ fn note_key_state(app: &mut WordApp, e: &egui::Event, b: &mut Batch) {
             b.mac_cmd_held = m.mac_cmd;
             let had_other_mods = b.current_mods.shift || b.current_mods.ctrl || b.current_mods.alt;
             b.current_mods = *m;
-            if m.is_none() && !had_other_mods {
+            if m.is_none() && !had_other_mods && !b.super_pressed_in_batch {
                 b.super_key_held = false;
             }
         }
         egui::Event::WindowFocused(false) => {
             b.super_key_held = false;
+            b.super_pressed_in_batch = false;
             b.mac_cmd_held = false;
             b.current_mods = egui::Modifiers::default();
         }

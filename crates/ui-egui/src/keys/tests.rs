@@ -1264,6 +1264,21 @@ fn super_space_does_not_type_space() {
     );
     assert_eq!(doc_text(&a), "", "Win+Space within a single frame must not type a space into the document");
 
+    // Wayland event sequence: Super-down, ModifiersChanged(none), Space-down, Text(" "), Space-up, Super-up.
+    // An empty modifier event following a Super press must not clear super_key_held.
+    frame(
+        &mut a,
+        vec![
+            key(Key::SuperLeft, true, none),
+            egui::Event::ModifiersChanged(none),
+            key(Key::Space, true, none),
+            egui::Event::Text(" ".into()),
+            key(Key::Space, false, none),
+            key(Key::SuperLeft, false, none),
+        ],
+    );
+    assert_eq!(doc_text(&a), "", "Win+Space with empty ModifiersChanged after Super press must not type space");
+
     // Cross-frame release: Super down in frame 1; Space-down, Text(" "), Space-up, and Super-up in frame 2.
     // In egui, `ctx.input(|i| i.key_down(Key::SuperLeft))` is false in frame 2 because it is released
     // within frame 2; the prior-frame state in app.canvas.super_held must preserve it until the release event.
